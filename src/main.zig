@@ -18,6 +18,7 @@ pub const PrintOptions = Window.PrintOptions;
 pub const Style = Cell.Style;
 pub const Color = Cell.Color;
 pub const Image = @import("Image.zig");
+pub const sixel = @import("sixel.zig");
 pub const Mouse = @import("Mouse.zig");
 pub const Screen = @import("Screen.zig");
 pub const AllocatingScreen = @import("InternalScreen.zig");

@@ -269,7 +269,8 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
                         return self.postEvent(.{ .key_release = mut_key });
                     }
                 },
-                .cap_da1 => {
+                .cap_da1 => |da1| {
+                    vx.applyDa1(da1);
                     std.Io.futexWake(vx.io, std.atomic.Value(u32), &vx.query_futex, 10);
                     vx.queries_done.store(true, .unordered);
                 },
@@ -406,6 +407,15 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
                     log.info("pixel mouse capability detected", .{});
                     vx.caps.sgr_pixels = true;
                 },
+                .cap_sixel_geometry => |geometry| {
+                    // Retained only; `applyDa1` decides once the DA1
+                    // arrives.
+                    log.info(
+                        "sixel geometry reported: {d}x{d}",
+                        .{ geometry.width, geometry.height },
+                    );
+                    vx.sixel_geometry = geometry;
+                },
                 .cap_color_scheme_updates => {
                     log.info("color_scheme_updates capability detected", .{});
                     vx.caps.color_scheme_updates = true;
@@ -414,7 +424,8 @@ pub fn handleEventGeneric(self: anytype, vx: *Vaxis, cache: *GraphemeCache, Even
                     log.info("multi cursor capability detected", .{});
                     vx.caps.multi_cursor = true;
                 },
-                .cap_da1 => {
+                .cap_da1 => |da1| {
+                    vx.applyDa1(da1);
                     std.Io.futexWake(vx.io, std.atomic.Value(u32), &vx.query_futex, 10);
                     vx.queries_done.store(true, .unordered);
                 },

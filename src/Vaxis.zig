@@ -13,6 +13,7 @@ const Screen = @import("Screen.zig");
 const Cursor = Screen.Cursor;
 const unicode = @import("unicode.zig");
 const Window = @import("Window.zig");
+const sixel = @import("sixel.zig");
 
 const Hyperlink = Cell.Hyperlink;
 const KittyFlags = Key.KittyFlags;
@@ -32,6 +33,10 @@ const log = std.log.scoped(.vaxis);
 pub const Capabilities = struct {
     kitty_keyboard: bool = false,
     kitty_graphics: bool = false,
+    /// Sixel raster graphics. Set only when the primary device attributes
+    /// claim attribute 4 and the terminal answered the XTSMGRAPHICS geometry
+    /// query; never inferred from a terminal name.
+    sixel_graphics: bool = false,
     no_color: bool = false,
     rgb: bool = false,
     unicode: gwidth.Method = .wcwidth,
@@ -40,6 +45,29 @@ pub const Capabilities = struct {
     explicit_width: bool = false,
     scaled_text: bool = false,
     multi_cursor: bool = false,
+};
+
+/// A cell rectangle occupied by a sixel raster.
+pub const Rect = struct {
+    col: u16,
+    row: u16,
+    cols: u16,
+    rows: u16,
+
+    pub fn eql(a: Rect, b: Rect) bool {
+        return a.col == b.col and a.row == b.row and a.cols == b.cols and a.rows == b.rows;
+    }
+
+    pub fn contains(self: Rect, col: u16, row: u16) bool {
+        return col >= self.col and col < self.col + self.cols and
+            row >= self.row and row < self.row + self.rows;
+    }
+};
+
+/// A sixel placement together with the rectangle it landed on.
+const SixelFrame = struct {
+    rect: Rect,
+    placement: sixel.Placement,
 };
 
 pub const Options = struct {
@@ -77,6 +105,24 @@ queries_done: atomic.Value(bool) = atomic.Value(bool).init(true),
 
 // images
 next_img_id: u32 = 1,
+
+/// The maximum sixel raster the terminal reported, or null if it never
+/// answered the geometry query.
+sixel_geometry: ?@import("event.zig").SixelGeometry = null,
+
+/// Loaded sixel rasters, owned by Vaxis: decoded and quantized, ready to
+/// encode. Nothing has been sent to the terminal.
+sixel_images: std.ArrayList(sixel.Image) = .empty,
+next_sixel_id: u32 = 1,
+/// The allocator the sixel rasters were loaded with; `render` takes no
+/// allocator and payloads are encoded there.
+sixel_gpa: ?std.mem.Allocator = null,
+/// The cell rectangle the last rendered sixel occupied, so the next render
+/// can erase it. The invariant is that this describes exactly what is on
+/// screen.
+sixel_last_rect: ?Rect = null,
+/// What was last sent, so an unchanged raster is not streamed again.
+sixel_last_placement: ?sixel.Placement = null,
 
 sgr: enum {
     standard,
@@ -124,6 +170,7 @@ pub fn deinit(self: *Vaxis, alloc: ?std.mem.Allocator, tty: *std.Io.Writer) void
     self.resetState(tty) catch {};
 
     if (alloc) |a| {
+        self.clearSixelImages(a);
         if (self.state.prev_cursor_secondary.ptr != self.screen.cursor_secondary.ptr)
             a.free(self.state.prev_cursor_secondary);
         a.free(self.screen.cursor_secondary);
@@ -164,6 +211,9 @@ pub fn resetState(self: *Vaxis, tty: *std.Io.Writer) !void {
         }
         try tty.writeAll(ctlseqs.erase_below_cursor);
     }
+    // Whatever raster was on screen is gone with the erase above.
+    self.sixel_last_rect = null;
+    self.sixel_last_placement = null;
     if (self.state.color_scheme_updates) {
         try tty.writeAll(ctlseqs.color_scheme_reset);
         self.state.color_scheme_updates = false;
@@ -199,6 +249,9 @@ pub fn resize(
     winsize: Winsize,
 ) !void {
     log.debug("resizing screen: width={d} height={d}", .{ winsize.cols, winsize.rows });
+    // Rasters are encoded for one cell geometry, and a resize can change the
+    // pixel size of a cell, so every loaded sixel is stale here.
+    self.clearSixelImages(alloc);
     self.screen.deinit(alloc);
     self.screen = try Screen.init(alloc, winsize);
     self.screen.width_method = self.caps.unicode;
@@ -319,6 +372,9 @@ pub fn queryTerminalSend(vx: *Vaxis, tty: *std.Io.Writer) !void {
         ctlseqs.xtversion ++
         ctlseqs.csi_u_query ++
         ctlseqs.kitty_graphics_query ++
+        // Before the device attributes on purpose: DA1 is what ends the query
+        // phase, and the sixel decision needs this answer already in hand.
+        ctlseqs.sixel_geometry_query ++
         ctlseqs.primary_device_attrs);
 
     try tty.flush();
@@ -457,6 +513,13 @@ pub fn render(self: *Vaxis, tty: *std.Io.Writer) !void {
         try startRender.run(self, tty, &cursor_pos, &reposition, &started, &sync_active);
     }
 
+    // Found before the cell pass so the pass can tell whether it painted
+    // inside the raster's rectangle: sixel pixels live in the terminal's cell
+    // buffer, so a repainted cell wipes them, and the raster is written after
+    // the cell pass and re-sent when that happens.
+    const sixel_place: ?SixelFrame = if (self.caps.sixel_graphics) self.findSixelPlacement() else null;
+    var sixel_overdrawn = false;
+
     var i: usize = 0;
     while (i < self.screen.buf.len) {
         const cell = self.screen.buf[i];
@@ -506,6 +569,9 @@ pub fn render(self: *Vaxis, tty: *std.Io.Writer) !void {
             try startRender.run(self, tty, &cursor_pos, &reposition, &started, &sync_active);
         }
         self.screen_last.buf[i].skipped = false;
+        if (sixel_place) |place| {
+            if (place.rect.contains(col, row)) sixel_overdrawn = true;
+        }
         defer {
             cursor = cell.style;
             link = cell.link;
@@ -788,6 +854,81 @@ pub fn render(self: *Vaxis, tty: *std.Io.Writer) !void {
         cursor_pos.col = col + w;
         cursor_pos.row = row;
     }
+
+    // The raster goes last, on top of the cells.
+    if (self.caps.sixel_graphics) sixel_draw: {
+        const place = sixel_place orelse {
+            // Nothing to show; erase whatever was showing.
+            const last = self.sixel_last_rect orelse break :sixel_draw;
+            if (!started)
+                try startRender.run(self, tty, &cursor_pos, &reposition, &started, &sync_active);
+            try eraseSixelRect(tty, last.col, last.row, last.cols, last.rows);
+            self.blankSixelRect(last);
+            self.sixel_last_rect = null;
+            self.sixel_last_placement = null;
+            reposition = true;
+            break :sixel_draw;
+        };
+
+        // Streamed, not retained: send only when it would differ from what
+        // the terminal already has -- a new frame, a move, a full refresh, or
+        // cells repainted over its pixels.
+        const same = if (self.sixel_last_placement) |prev|
+            prev.eql(place.placement) and
+                (if (self.sixel_last_rect) |last| last.eql(place.rect) else false)
+        else
+            false;
+        if (same and !sixel_overdrawn and !self.refresh) break :sixel_draw;
+
+        const gpa = self.sixel_gpa orelse break :sixel_draw;
+        const img = self.findSixelImage(place.placement.img_id) orelse break :sixel_draw;
+        if (!started)
+            try startRender.run(self, tty, &cursor_pos, &reposition, &started, &sync_active);
+
+        const payload: []const u8 = payload: {
+            if (place.placement.clip) |clip| {
+                // Clipped frames occur only while the raster crosses a
+                // screen edge; they are encoded on demand rather than
+                // cached.
+                break :payload sixel.encodeAlloc(gpa, img.*, clip) catch |err| {
+                    log.debug("sixel encode failed: {t}", .{err});
+                    break :sixel_draw;
+                };
+            }
+            if (img.payload == null) {
+                img.payload = sixel.encodeAlloc(gpa, img.*, null) catch |err| {
+                    log.debug("sixel encode failed: {t}", .{err});
+                    break :sixel_draw;
+                };
+            }
+            break :payload img.payload.?;
+        };
+        defer if (place.placement.clip != null) gpa.free(payload);
+
+        // Erase where it was, if that is somewhere else, then where it is
+        // going. The second erase runs on every frame: a transparent frame
+        // leaves untouched pixels alone, so without it the previous frame
+        // shows through its holes.
+        if (self.sixel_last_rect) |last| {
+            if (!last.eql(place.rect)) {
+                try eraseSixelRect(tty, last.col, last.row, last.cols, last.rows);
+                self.blankSixelRect(last);
+            }
+        }
+        try eraseSixelRect(tty, place.rect.col, place.rect.row, place.rect.cols, place.rect.rows);
+        self.blankSixelRect(place.rect);
+
+        // A sixel leaves the cursor wherever the terminal decides, so save
+        // and restore it around the payload.
+        try tty.writeAll(ctlseqs.save_cursor);
+        try tty.print(ctlseqs.cup, .{ place.rect.row + 1, place.rect.col + 1 });
+        try tty.writeAll(payload);
+        try tty.writeAll(ctlseqs.restore_cursor);
+        self.sixel_last_rect = place.rect;
+        self.sixel_last_placement = place.placement;
+        reposition = true;
+    }
+
     if (!started) return;
     if (self.screen.cursor_vis) {
         if (self.state.alt_screen) {
@@ -1100,6 +1241,136 @@ pub fn loadImage(
     };
     defer img.deinit(alloc);
     return self.transmitImage(alloc, tty, &img, .png);
+}
+
+/// Applies the primary device attributes. Sixel needs both halves: the
+/// attribute bit claims the protocol, and the geometry report proves the
+/// terminal answered a graphics query -- a multiplexer can forward the bit
+/// while swallowing the query.
+pub fn applyDa1(self: *Vaxis, da1: @import("event.zig").Da1) void {
+    if (da1.sixel and self.sixel_geometry != null) {
+        log.info("sixel graphics capability detected", .{});
+        self.caps.sixel_graphics = true;
+    } else if (da1.sixel) {
+        log.info("sixel claimed in device attributes but no geometry reported; not enabling", .{});
+    }
+}
+
+/// The measured pixel size of one cell, or null when the terminal reported
+/// no usable pixel geometry; callers fall back rather than guess.
+pub fn cellPixelSize(self: Vaxis) ?struct { width: u16, height: u16 } {
+    if (self.screen.width == 0 or self.screen.height == 0) return null;
+    if (self.screen.width_pix == 0 or self.screen.height_pix == 0) return null;
+    const w = self.screen.width_pix / self.screen.width;
+    const h = self.screen.height_pix / self.screen.height;
+    if (w == 0 or h == 0) return null;
+    return .{ .width = w, .height = h };
+}
+
+/// Decodes an image and holds it at the pixel size of a `cols` x `rows` cell
+/// rectangle, ready to be placed. Nothing is written to the terminal here:
+/// payloads travel at render time. The returned id stays valid until
+/// `clearSixelImages`, which resize and teardown both call.
+pub fn loadSixelImage(
+    self: *Vaxis,
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    cols: u16,
+    rows: u16,
+) !u32 {
+    if (!self.caps.sixel_graphics) return error.NoGraphicsCapability;
+    const cell = self.cellPixelSize() orelse return sixel.Error.SixelGeometryUnusable;
+    const width = std.math.mul(u16, cols, cell.width) catch return sixel.Error.SixelRasterTooLarge;
+    const height = std.math.mul(u16, rows, cell.height) catch return sixel.Error.SixelRasterTooLarge;
+    if (self.sixel_geometry) |max| {
+        if (width > max.width or height > max.height) return sixel.Error.SixelRasterTooLarge;
+    }
+
+    const id = self.next_sixel_id;
+    var img = try sixel.decode(gpa, id, bytes, width, height);
+    errdefer img.deinit(gpa);
+    try self.sixel_images.append(gpa, img);
+    self.sixel_gpa = gpa;
+    self.next_sixel_id += 1;
+    return id;
+}
+
+/// Whether a raster is still loaded. A resize drops every raster, so this is
+/// how a caller notices its ids went stale and re-loads.
+pub fn hasSixelImage(self: *Vaxis, id: u32) bool {
+    return self.findSixelImage(id) != null;
+}
+
+fn findSixelImage(self: *Vaxis, id: u32) ?*sixel.Image {
+    for (self.sixel_images.items) |*img| {
+        if (img.id == id) return img;
+    }
+    return null;
+}
+
+/// The first sixel placement in scan order, if any. One placement per frame
+/// is the contract: sixel is streamed, and several rasters would multiply
+/// the per-frame byte cost.
+fn findSixelPlacement(self: *Vaxis) ?SixelFrame {
+    for (self.screen.buf, 0..) |cell, i| {
+        const placement = cell.sixel orelse continue;
+        return .{
+            .rect = .{
+                .col = @intCast(i % self.screen.width),
+                .row = @intCast(i / self.screen.width),
+                .cols = placement.cols,
+                .rows = placement.rows,
+            },
+            .placement = placement,
+        };
+    }
+    return null;
+}
+
+/// Records that `rect` was erased by making the diff's copy of it blank, so
+/// the diff repaints content it would otherwise believe is still visible.
+/// Blank rather than dirty: blank next-frame cells produce no output and
+/// leave the raster alone.
+fn blankSixelRect(self: *Vaxis, rect: Rect) void {
+    var r: u16 = 0;
+    while (r < rect.rows) : (r += 1) {
+        const y = rect.row + r;
+        if (y >= self.screen_last.height) break;
+        var c: u16 = 0;
+        while (c < rect.cols) : (c += 1) {
+            const x = rect.col + c;
+            if (x >= self.screen_last.width) break;
+            self.screen_last.writeCell(x, y, .{});
+            self.screen_last.buf[@as(usize, y) * self.screen_last.width + x].skipped = false;
+        }
+    }
+}
+
+/// Drops every loaded sixel raster and forgets what was on screen. Called on
+/// resize and teardown: payloads are only valid for the cell geometry they
+/// were encoded at.
+pub fn clearSixelImages(self: *Vaxis, gpa: std.mem.Allocator) void {
+    for (self.sixel_images.items) |*img| img.deinit(gpa);
+    self.sixel_images.clearAndFree(gpa);
+    self.sixel_last_rect = null;
+    self.sixel_last_placement = null;
+    self.sixel_gpa = null;
+}
+
+/// Erases the cell rectangle a sixel occupied. Sixel pixels live in the
+/// terminal's cell buffer, so erasing the cells is what removes them.
+fn eraseSixelRect(
+    tty: *std.Io.Writer,
+    col: u16,
+    row: u16,
+    cols: u16,
+    rows: u16,
+) !void {
+    var r: u16 = 0;
+    while (r < rows) : (r += 1) {
+        try tty.print(ctlseqs.cup, .{ row + r + 1, col + 1 });
+        try tty.print(ctlseqs.erase_chars, .{cols});
+    }
 }
 
 /// deletes an image from the terminal's memory
@@ -1529,4 +1800,292 @@ test "render: no output when no changes" {
     const output = try render_writer.toOwnedSlice();
     defer std.testing.allocator.free(output);
     try std.testing.expectEqual(@as(usize, 0), output.len);
+}
+
+/// A Vaxis with a `cols` x `rows` screen, 10x20 pixel cells, and sixel
+/// enabled.
+fn testVaxisSixel(
+    gpa: std.mem.Allocator,
+    env_map: *std.process.Environ.Map,
+    tty: *std.Io.Writer,
+    cols: u16,
+    rows: u16,
+) !Vaxis {
+    var vx = try Vaxis.init(std.testing.io, gpa, env_map, .{});
+    errdefer vx.deinit(gpa, tty);
+    vx.caps.sixel_graphics = true;
+    vx.sixel_geometry = .{ .width = 1000, .height = 1000 };
+    try vx.resize(gpa, tty, .{
+        .cols = cols,
+        .rows = rows,
+        .x_pixel = cols * 10,
+        .y_pixel = rows * 20,
+    });
+    return vx;
+}
+
+/// Registers a solid raster directly, bypassing the decoder.
+fn testLoadSolidSixel(vx: *Vaxis, gpa: std.mem.Allocator) !u32 {
+    const w: u16 = 20;
+    const h: u16 = 20;
+    const indexed = try gpa.alloc(u8, @as(usize, w) * h);
+    @memset(indexed, sixel.quantize(255, 0, 0));
+    const id = vx.next_sixel_id;
+    try vx.sixel_images.append(gpa, .{
+        .id = id,
+        .width = w,
+        .height = h,
+        .indexed = indexed,
+    });
+    vx.next_sixel_id += 1;
+    vx.sixel_gpa = gpa;
+    return id;
+}
+
+test "applyDa1 needs both the attribute and a geometry report" {
+    const gpa = std.testing.allocator;
+    var env_map = try std.testing.environ.createMap(gpa);
+    defer env_map.deinit();
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+
+    // The attribute alone is not support: a multiplexer can forward it while
+    // swallowing the protocol.
+    {
+        var vx = try Vaxis.init(std.testing.io, gpa, &env_map, .{});
+        defer vx.deinit(gpa, &w.writer);
+        vx.applyDa1(.{ .sixel = true });
+        try std.testing.expect(!vx.caps.sixel_graphics);
+    }
+    // A geometry report alone is not support either.
+    {
+        var vx = try Vaxis.init(std.testing.io, gpa, &env_map, .{});
+        defer vx.deinit(gpa, &w.writer);
+        vx.sixel_geometry = .{ .width = 800, .height = 480 };
+        vx.applyDa1(.{});
+        try std.testing.expect(!vx.caps.sixel_graphics);
+    }
+    // Both halves, from the terminal's own answers.
+    {
+        var vx = try Vaxis.init(std.testing.io, gpa, &env_map, .{});
+        defer vx.deinit(gpa, &w.writer);
+        vx.sixel_geometry = .{ .width = 800, .height = 480 };
+        vx.applyDa1(.{ .sixel = true });
+        try std.testing.expect(vx.caps.sixel_graphics);
+    }
+}
+
+test "cellPixelSize refuses to guess when the terminal reports no pixels" {
+    const gpa = std.testing.allocator;
+    var env_map = try std.testing.environ.createMap(gpa);
+    defer env_map.deinit();
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    var vx = try Vaxis.init(std.testing.io, gpa, &env_map, .{});
+    defer vx.deinit(gpa, &w.writer);
+
+    try vx.resize(gpa, &w.writer, .{ .cols = 80, .rows = 24, .x_pixel = 0, .y_pixel = 0 });
+    try std.testing.expectEqual(@as(?@TypeOf(vx.cellPixelSize().?), null), vx.cellPixelSize());
+
+    try vx.resize(gpa, &w.writer, .{ .cols = 80, .rows = 24, .x_pixel = 800, .y_pixel = 480 });
+    const cell = vx.cellPixelSize().?;
+    try std.testing.expectEqual(@as(u16, 10), cell.width);
+    try std.testing.expectEqual(@as(u16, 20), cell.height);
+}
+
+test "render places a sixel payload bracketed by a cursor save and restore" {
+    const gpa = std.testing.allocator;
+    var env_map = try std.testing.environ.createMap(gpa);
+    defer env_map.deinit();
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    var vx = try testVaxisSixel(gpa, &env_map, &w.writer, 20, 6);
+    defer vx.deinit(gpa, &w.writer);
+    const id = try testLoadSolidSixel(&vx, gpa);
+
+    vx.screen.writeCell(3, 2, .{ .sixel = .{ .img_id = id, .cols = 2, .rows = 1 } });
+    w.clearRetainingCapacity();
+    try vx.render(&w.writer);
+    const out = w.written();
+
+    const dcs = std.mem.indexOf(u8, out, "\x1bP0;1;0q").?;
+    const save = std.mem.indexOf(u8, out, ctlseqs.save_cursor).?;
+    const restore = std.mem.lastIndexOf(u8, out, ctlseqs.restore_cursor).?;
+    try std.testing.expect(save < dcs);
+    try std.testing.expect(dcs < restore);
+    // Positioned at the placement cell, 1-indexed.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[3;4H") != null);
+    // The rectangle is erased before the payload.
+    const erase = std.mem.indexOf(u8, out, "\x1b[2X").?;
+    try std.testing.expect(erase < dcs);
+    // Exactly one payload per frame.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\x1bP0;1;0q"));
+}
+
+test "render sends nothing when the terminal never earned the capability" {
+    const gpa = std.testing.allocator;
+    var env_map = try std.testing.environ.createMap(gpa);
+    defer env_map.deinit();
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    var vx = try testVaxisSixel(gpa, &env_map, &w.writer, 20, 6);
+    defer vx.deinit(gpa, &w.writer);
+    const id = try testLoadSolidSixel(&vx, gpa);
+
+    // Not one byte of image control data may reach an incapable terminal.
+    vx.caps.sixel_graphics = false;
+    vx.screen.writeCell(3, 2, .{ .sixel = .{ .img_id = id, .cols = 2, .rows = 1 } });
+    w.clearRetainingCapacity();
+    try vx.render(&w.writer);
+    const out = w.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1bP") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b[2X") == null);
+}
+
+test "a raster that moves erases the rectangle it left behind" {
+    const gpa = std.testing.allocator;
+    var env_map = try std.testing.environ.createMap(gpa);
+    defer env_map.deinit();
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    var vx = try testVaxisSixel(gpa, &env_map, &w.writer, 20, 6);
+    defer vx.deinit(gpa, &w.writer);
+    const id = try testLoadSolidSixel(&vx, gpa);
+
+    vx.screen.writeCell(3, 2, .{ .sixel = .{ .img_id = id, .cols = 2, .rows = 1 } });
+    try vx.render(&w.writer);
+    try std.testing.expect(vx.sixel_last_rect != null);
+
+    // One cell to the right on the next frame.
+    vx.screen.clear();
+    vx.screen.writeCell(4, 2, .{ .sixel = .{ .img_id = id, .cols = 2, .rows = 1 } });
+    w.clearRetainingCapacity();
+    try vx.render(&w.writer);
+    const out = w.written();
+    // The old rectangle is erased at its own position...
+    const old_erase = std.mem.indexOf(u8, out, "\x1b[3;4H\x1b[2X").?;
+    // ...before the new frame is drawn at the new one.
+    const new_pos = std.mem.indexOf(u8, out, "\x1b[3;5H").?;
+    try std.testing.expect(old_erase < new_pos);
+    try std.testing.expectEqual(@as(u16, 4), vx.sixel_last_rect.?.col);
+
+    // And when the placement disappears entirely, so do the pixels.
+    vx.screen.clear();
+    w.clearRetainingCapacity();
+    try vx.render(&w.writer);
+    try std.testing.expect(std.mem.indexOf(u8, w.written(), "\x1b[3;5H\x1b[2X") != null);
+    try std.testing.expectEqual(@as(?Rect, null), vx.sixel_last_rect);
+}
+
+test "resize drops every loaded raster" {
+    const gpa = std.testing.allocator;
+    var env_map = try std.testing.environ.createMap(gpa);
+    defer env_map.deinit();
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    var vx = try testVaxisSixel(gpa, &env_map, &w.writer, 20, 6);
+    defer vx.deinit(gpa, &w.writer);
+    _ = try testLoadSolidSixel(&vx, gpa);
+    vx.sixel_last_rect = .{ .col = 1, .row = 1, .cols = 2, .rows = 1 };
+
+    // A resize can change the pixel size of a cell, so a raster encoded for
+    // the old geometry is stale rather than merely misplaced.
+    try vx.resize(gpa, &w.writer, .{ .cols = 40, .rows = 10, .x_pixel = 320, .y_pixel = 170 });
+    try std.testing.expectEqual(@as(usize, 0), vx.sixel_images.items.len);
+    try std.testing.expectEqual(@as(?Rect, null), vx.sixel_last_rect);
+}
+
+test "loadSixelImage refuses geometry it cannot size a raster from" {
+    const gpa = std.testing.allocator;
+    var env_map = try std.testing.environ.createMap(gpa);
+    defer env_map.deinit();
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    var vx = try Vaxis.init(std.testing.io, gpa, &env_map, .{});
+    defer vx.deinit(gpa, &w.writer);
+
+    // No capability: not even a decode is attempted.
+    try std.testing.expectError(error.NoGraphicsCapability, vx.loadSixelImage(gpa, "", 2, 1));
+
+    // Capability, but the terminal reports no pixel geometry.
+    vx.caps.sixel_graphics = true;
+    try vx.resize(gpa, &w.writer, .{ .cols = 20, .rows = 6, .x_pixel = 0, .y_pixel = 0 });
+    try std.testing.expectError(sixel.Error.SixelGeometryUnusable, vx.loadSixelImage(gpa, "", 2, 1));
+
+    // Geometry, but larger than the terminal said it would accept.
+    try vx.resize(gpa, &w.writer, .{ .cols = 20, .rows = 6, .x_pixel = 200, .y_pixel = 120 });
+    vx.sixel_geometry = .{ .width = 16, .height = 16 };
+    try std.testing.expectError(sixel.Error.SixelRasterTooLarge, vx.loadSixelImage(gpa, "", 4, 4));
+}
+
+test "an unchanged raster is not streamed again" {
+    const gpa = std.testing.allocator;
+    var env_map = try std.testing.environ.createMap(gpa);
+    defer env_map.deinit();
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    var vx = try testVaxisSixel(gpa, &env_map, &w.writer, 20, 6);
+    defer vx.deinit(gpa, &w.writer);
+    const id = try testLoadSolidSixel(&vx, gpa);
+
+    const placement: sixel.Placement = .{ .img_id = id, .cols = 2, .rows = 1 };
+    vx.screen.writeCell(3, 2, .{ .sixel = placement });
+    try vx.render(&w.writer);
+
+    // Same frame, same place: the terminal already has it.
+    w.clearRetainingCapacity();
+    try vx.render(&w.writer);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, w.written(), "\x1bP0;1;0q"));
+
+    // A new frame is a new payload.
+    vx.screen.writeCell(3, 2, .{ .sixel = .{ .img_id = id, .cols = 2, .rows = 1, .clip = .{ .x = 0, .width = 10 } } });
+    w.clearRetainingCapacity();
+    try vx.render(&w.writer);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.written(), "\x1bP0;1;0q"));
+}
+
+test "a cell painted over the raster makes it travel again" {
+    const gpa = std.testing.allocator;
+    var env_map = try std.testing.environ.createMap(gpa);
+    defer env_map.deinit();
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    var vx = try testVaxisSixel(gpa, &env_map, &w.writer, 20, 6);
+    defer vx.deinit(gpa, &w.writer);
+    const id = try testLoadSolidSixel(&vx, gpa);
+
+    const placement: sixel.Placement = .{ .img_id = id, .cols = 2, .rows = 1 };
+    vx.screen.writeCell(3, 2, .{ .sixel = placement });
+    try vx.render(&w.writer);
+
+    // Text inside the rectangle wipes the pixels it covers, so the raster is
+    // re-sent after the cells and ends up on top.
+    vx.screen.writeCell(4, 2, .{ .char = .{ .grapheme = "x", .width = 1 } });
+    w.clearRetainingCapacity();
+    try vx.render(&w.writer);
+    const out = w.written();
+    const text = std.mem.indexOf(u8, out, "x").?;
+    const dcs = std.mem.indexOf(u8, out, "\x1bP0;1;0q").?;
+    try std.testing.expect(text < dcs);
+}
+
+test "a full refresh re-sends the raster" {
+    const gpa = std.testing.allocator;
+    var env_map = try std.testing.environ.createMap(gpa);
+    defer env_map.deinit();
+    var w: std.Io.Writer.Allocating = .init(gpa);
+    defer w.deinit();
+    var vx = try testVaxisSixel(gpa, &env_map, &w.writer, 20, 6);
+    defer vx.deinit(gpa, &w.writer);
+    const id = try testLoadSolidSixel(&vx, gpa);
+
+    vx.screen.writeCell(3, 2, .{ .sixel = .{ .img_id = id, .cols = 2, .rows = 1 } });
+    try vx.render(&w.writer);
+
+    // A refresh clears the screen, images included, so the raster has to go
+    // out again even though the placement did not change.
+    vx.queueRefresh();
+    w.clearRetainingCapacity();
+    try vx.render(&w.writer);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.written(), "\x1bP0;1;0q"));
 }

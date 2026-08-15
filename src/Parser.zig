@@ -2,6 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 const Color = @import("Cell.zig").Color;
 const Event = @import("event.zig").Event;
+const Da1 = @import("event.zig").Da1;
 const Key = @import("Key.zig");
 const Mouse = @import("Mouse.zig");
 const uucode = @import("uucode");
@@ -356,6 +357,25 @@ inline fn parseCsi(input: []const u8, text_buf: []u8) Result {
     const null_event: Result = .{ .event = null, .n = sequence.len };
 
     const final = sequence[sequence.len - 1];
+
+    // XTSMGRAPHICS report (CSI ? Pi ; Ps ; Pv S), which shares its final byte
+    // with the legacy F4 key. The leading '?' is what separates them, so this
+    // has to be decided before the key branch below claims the 'S'.
+    if (final == 'S' and sequence.len > 3 and sequence[2] == '?') {
+        var iter = std.mem.splitScalar(u8, sequence[3 .. sequence.len - 1], ';');
+        const item = std.fmt.parseUnsigned(u16, iter.next() orelse return null_event, 10) catch return null_event;
+        const status = std.fmt.parseUnsigned(u16, iter.next() orelse return null_event, 10) catch return null_event;
+        // Item 2 is the graphics geometry; status 0 is success.
+        if (item != 2 or status != 0) return null_event;
+        const width = std.fmt.parseUnsigned(u16, iter.next() orelse return null_event, 10) catch return null_event;
+        const height = std.fmt.parseUnsigned(u16, iter.next() orelse return null_event, 10) catch return null_event;
+        if (width == 0 or height == 0) return null_event;
+        return .{
+            .event = .{ .cap_sixel_geometry = .{ .width = width, .height = height } },
+            .n = sequence.len,
+        };
+    }
+
     switch (final) {
         'A', 'B', 'C', 'D', 'E', 'F', 'H', 'P', 'Q', 'R', 'S' => {
             // Legacy keys
@@ -504,7 +524,18 @@ inline fn parseCsi(input: []const u8, text_buf: []u8) Result {
             // Primary DA (CSI ? Pm c)
             std.debug.assert(sequence.len >= 4); // ESC [ ? c == 4 bytes
             switch (input[2]) {
-                '?' => return .{ .event = .cap_da1, .n = sequence.len },
+                '?' => {
+                    // ';'-separated attributes after the '?'; attribute 4 is
+                    // sixel. Unparseable attributes are ignored rather than
+                    // failing the report, which also ends the query phase.
+                    var da1: Da1 = .{};
+                    var iter = std.mem.splitScalar(u8, sequence[3 .. sequence.len - 1], ';');
+                    while (iter.next()) |attr| {
+                        const n = std.fmt.parseUnsigned(u16, attr, 10) catch continue;
+                        if (n == 4) da1.sixel = true;
+                    }
+                    return .{ .event = .{ .cap_da1 = da1 }, .n = sequence.len };
+                },
                 else => return null_event,
             }
         },
@@ -1221,12 +1252,69 @@ test "parse(csi): primary da" {
     const input = "\x1b[?c";
     const result = parseCsi(input, &buf);
     const expected: Result = .{
-        .event = .cap_da1,
+        .event = .{ .cap_da1 = .{} },
         .n = input.len,
     };
 
     try testing.expectEqual(expected.n, result.n);
     try testing.expectEqual(expected.event, result.event);
+}
+
+test "parse(csi): primary da reports the sixel attribute" {
+    var buf: [1]u8 = undefined;
+    // xterm with sixel compiled in: attribute 4 among the others.
+    {
+        const input = "\x1b[?62;4;6;9;22c";
+        const result = parseCsi(input, &buf);
+        try testing.expectEqual(input.len, result.n);
+        try testing.expect(result.event.?.cap_da1.sixel);
+    }
+    // A terminal with no sixel attribute. 14 and 40 must not be mistaken for
+    // a 4: the attributes are whole numbers, not digits.
+    {
+        const input = "\x1b[?62;14;40;22c";
+        const result = parseCsi(input, &buf);
+        try testing.expectEqual(input.len, result.n);
+        try testing.expect(!result.event.?.cap_da1.sixel);
+    }
+    // A single bare attribute.
+    {
+        const input = "\x1b[?4c";
+        const result = parseCsi(input, &buf);
+        try testing.expect(result.event.?.cap_da1.sixel);
+    }
+}
+
+test "parse(csi): sixel geometry report" {
+    var buf: [1]u8 = undefined;
+    {
+        const input = "\x1b[?2;0;800;480S";
+        const result = parseCsi(input, &buf);
+        const expected: Result = .{
+            .event = .{ .cap_sixel_geometry = .{ .width = 800, .height = 480 } },
+            .n = input.len,
+        };
+        try testing.expectEqual(expected.n, result.n);
+        try testing.expectEqual(expected.event, result.event);
+    }
+    // A terminal declining the query (nonzero status) is not support, and
+    // neither is a zero geometry or a report about some other item.
+    for ([_][]const u8{
+        "\x1b[?2;1;800;480S",
+        "\x1b[?2;0;0;0S",
+        "\x1b[?1;0;800;480S",
+        "\x1b[?2;0S",
+    }) |input| {
+        const result = parseCsi(input, &buf);
+        try testing.expectEqual(input.len, result.n);
+        try testing.expectEqual(@as(?Event, null), result.event);
+    }
+    // The plain F4 key shares the final byte and must still parse as a key.
+    {
+        const input = "\x1b[1;2S";
+        const result = parseCsi(input, &buf);
+        try testing.expectEqual(Key.f4, result.event.?.key_press.codepoint);
+    }
 }
 
 test "parse(csi): dsr" {

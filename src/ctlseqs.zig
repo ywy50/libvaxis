@@ -10,6 +10,7 @@ pub const decrqm_unicode = "\x1b[?2027$p";
 pub const decrqm_color_scheme = "\x1b[?2031$p";
 pub const csi_u_query = "\x1b[?u";
 pub const kitty_graphics_query = "\x1b_Gi=1,a=q\x1b\\";
+// XTSMGRAPHICS: read the maximum sixel raster geometry.
 pub const sixel_geometry_query = "\x1b[?2;1;0S";
 pub const cursor_position_request = "\x1b[6n";
 pub const explicit_width_query = "\x1b]66;w=1; \x1b\\";
@@ -72,6 +73,12 @@ pub const show_secondary_cursor = "\x1b[>29;2:{d}:{d} q";
 
 // Erase
 pub const erase_below_cursor = "\x1b[J";
+// ECH: erase n characters from the cursor.
+pub const erase_chars = "\x1b[{d}X";
+
+// DECSC/DECRC, used around a sixel payload.
+pub const save_cursor = "\x1b7";
+pub const restore_cursor = "\x1b8";
 
 // alt screen
 pub const smcup = "\x1b[?1049h";

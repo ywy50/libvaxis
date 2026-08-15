@@ -1,10 +1,15 @@
 const std = @import("std");
 const Image = @import("Image.zig");
+const sixel_mod = @import("sixel.zig");
 
 char: Character = .{},
 style: Style = .{},
 link: Hyperlink = .{},
 image: ?Image.Placement = null,
+/// A sixel raster to display with this cell as its top-left corner. Separate
+/// from `image` (a kitty placement): kitty re-places retained media by id,
+/// while sixel streams the payload itself.
+sixel: ?sixel_mod.Placement = null,
 default: bool = false,
 /// Set to true if this cell is the last cell printed in a row before wrap. Vaxis will determine if
 /// it should rely on the terminal's autowrap feature which can help with primary screen resizes
