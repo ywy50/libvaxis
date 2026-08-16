@@ -163,6 +163,7 @@ inline fn parseSs3(input: []const u8) Result {
         'E' => .{ .codepoint = Key.kp_begin },
         'F' => .{ .codepoint = Key.end },
         'H' => .{ .codepoint = Key.home },
+        'M' => .{ .codepoint = Key.kp_enter },
         'P' => .{ .codepoint = Key.f1 },
         'Q' => .{ .codepoint = Key.f2 },
         'R' => .{ .codepoint = Key.f3 },
@@ -866,6 +867,18 @@ test "parse: xterm key up" {
         try testing.expectEqual(3, result.n);
         try testing.expectEqual(expected_event, result.event);
     }
+}
+
+test "parse: ss3 keypad enter" {
+    const alloc = testing.allocator_instance.allocator();
+    const input = "\x1bOM";
+    var parser: Parser = .{};
+    const result = try parser.parse(input, alloc);
+    const expected_key: Key = .{ .codepoint = Key.kp_enter };
+    const expected_event: Event = .{ .key_press = expected_key };
+
+    try testing.expectEqual(3, result.n);
+    try testing.expectEqual(expected_event, result.event);
 }
 
 test "parse: xterm shift+up" {
